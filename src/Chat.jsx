@@ -14,14 +14,14 @@ export default function Chat() {
   const [selectedUserId, setSelectedUserId] = useState(null);
   const [newMassageText, setNewMassageText] = useState("");
   const [messages, setMessages] = useState([]);
-  const { username, id, setId, setUsername } = useContext(UserContext);
+  const { username, id, setId, setUsername  } = useContext(UserContext);
   const divUnderMessages = useRef(null);
 
   useEffect(() => {
     connectToWs();
   }, []);
   function connectToWs() {
-    const ws = new WebSocket("wss://mern-api-tau.vercel.app");
+    const ws = new WebSocket("ws://localhost:4040");
     setWs(ws);
 
     ws.addEventListener("message", handleMessage);
@@ -99,11 +99,11 @@ export default function Chat() {
   }, [selectedUserId]);
 
   function logout() {
-    axios.post("/logout").then(() => {
-      setId(null);
-      setUsername(null);
-      setWs(null);
-    });
+    axios.post("/logout").then(()=> {
+      setId(null)
+      setUsername(null)
+      setWs(null)
+    })
   }
 
   const onlinePeopleExclOurUser = { ...onlinePeople };
