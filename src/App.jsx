@@ -3,7 +3,7 @@ import UserContextProvider from "./UserContext";
 import Routes from "./Routes";
 
 function App() {
-  axios.defaults.baseURL = "http://localhost:4040";
+  axios.defaults.baseURL = "https://abd-backend-chat.vercel.app";
   axios.defaults.withCredentials = true;
 
   return (
