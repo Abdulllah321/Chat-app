@@ -5,6 +5,10 @@ import axios from "axios";
 import ContactList from "./components/ContactList.jsx";
 import ChatWindow from "./components/ChatWindow.jsx";
 import MessageInput from "./components/MessageInput.jsx";
+import ChatHeader from "./components/ChatHeader.jsx";
+import { useCall } from "./CallContext.jsx";
+import IncomingCall from "./components/IncomingCall.jsx";
+import InCallUI from "./components/InCallUI.jsx";
 
 export default function Chat() {
   const [ws, setWs] = useState(null);
@@ -15,6 +19,8 @@ export default function Chat() {
   const [messages, setMessages] = useState([]);
   const [isTyping, setIsTyping] = useState(false);
   const { username, id, setId, setUsername } = useContext(UserContext);
+  const { call, setCall, setLocalStream, setRemoteStream } = useCall();
+  const peerConnection = useRef();
   const divUnderMessages = useRef();
 
   useEffect(() => {
@@ -86,8 +92,51 @@ export default function Chat() {
             : message
         )
       );
+    } else if (messageData['call-offer']) {
+        setCall({
+            isReceivingCall: true,
+            caller: messageData.sender,
+            offer: messageData['call-offer'],
+        });
+    } else if (messageData['call-answer']) {
+        peerConnection.current.setRemoteDescription(messageData['call-answer']);
+    } else if (messageData['ice-candidate']) {
+        peerConnection.current.addIceCandidate(messageData['ice-candidate']);
+    } else if (messageData['call-hangup']) {
+        setCall(null);
+        setLocalStream(null);
+        setRemoteStream(null);
+        peerConnection.current.close();
+    } else if (messageData['call-decline']) {
+        setCall(null);
     }
   }
+
+  useEffect(() => {
+    peerConnection.current = new RTCPeerConnection({
+        iceServers: [
+            {
+                urls: 'stun:stun.l.google.com:19302',
+            },
+        ],
+    });
+    peerConnection.current.onicecandidate = (event) => {
+        if (event.candidate) {
+            ws.send(JSON.stringify({
+                recipient: selectedUserId,
+                'ice-candidate': event.candidate,
+            }));
+        }
+    };
+    peerConnection.current.ontrack = (event) => {
+        setRemoteStream(event.streams[0]);
+    };
+    return () => {
+        if (peerConnection.current) {
+            peerConnection.current.close();
+        }
+    };
+  }, [selectedUserId]);
 
   function handleSendMessageReaction(messageId, reaction) {
     ws.send(
@@ -97,6 +146,52 @@ export default function Chat() {
         messageId: messageId,
       })
     );
+  }
+
+  async function startCall(type) {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: type === 'video', audio: true });
+    setLocalStream(stream);
+    stream.getTracks().forEach(track => peerConnection.current.addTrack(track, stream));
+    const offer = await peerConnection.current.createOffer();
+    await peerConnection.current.setLocalDescription(offer);
+    ws.send(JSON.stringify({
+        recipient: selectedUserId,
+        'call-offer': offer,
+    }));
+    setCall({ isCalling: true });
+  }
+
+  async function acceptCall() {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    setLocalStream(stream);
+    stream.getTracks().forEach(track => peerConnection.current.addTrack(track, stream));
+    await peerConnection.current.setRemoteDescription(call.offer);
+    const answer = await peerConnection.current.createAnswer();
+    await peerConnection.current.setLocalDescription(answer);
+    ws.send(JSON.stringify({
+        recipient: call.caller,
+        'call-answer': answer,
+    }));
+    setCall({ ...call, isReceivingCall: false, isCallInProgress: true });
+  }
+
+  function declineCall() {
+    ws.send(JSON.stringify({
+        recipient: call.caller,
+        'call-decline': true,
+    }));
+    setCall(null);
+  }
+
+  function hangup() {
+    ws.send(JSON.stringify({
+        recipient: selectedUserId,
+        'call-hangup': true,
+    }));
+    setCall(null);
+    setLocalStream(null);
+    setRemoteStream(null);
+    peerConnection.current.close();
   }
 
   function sendTyping() {
@@ -207,6 +302,16 @@ export default function Chat() {
 
   return (
     <div className="flex h-screen">
+      {call?.isReceivingCall && (
+        <IncomingCall
+          caller={onlinePeople[call.caller]?.username || 'Unknown Caller'}
+          onAccept={acceptCall}
+          onDecline={declineCall}
+        />
+      )}
+      {call?.isCallInProgress && (
+          <InCallUI onHangup={hangup} />
+      )}
       <ContactList
         onlinePeople={onlinePeopleExclOurUser}
         offlinePeople={offlinePeople}
@@ -216,6 +321,9 @@ export default function Chat() {
         logout={logout}
       />
       <div className="flex flex-col bg-blue-50 w-2/3 p-2">
+        {!!selectedUserId && (
+            <ChatHeader selectedUsername={onlinePeople[selectedUserId] || (offlinePeople[selectedUserId] ? offlinePeople[selectedUserId].username : '')} onStartCall={startCall} />
+        )}
         <ChatWindow
           selectedUserId={selectedUserId}
           messages={messages}

@@ -2,15 +2,15 @@
 const express = require('express');
 const mongoose = require('mongoose');
 const dotenv = require('dotenv');
+const { MongoMemoryServer } = require('mongodb-memory-server');
 
 dotenv.config();
-mongoose.connect(process.env.MONGO_URL);
+
 const User = require('./models/User');
 const Message = require('./models/Message');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
-const cookieParser = require('cookie-parser');
 const ws = require('ws');
 const fs = require('fs');
 
@@ -19,7 +19,6 @@ const jwtSecret = process.env.JWT_SECRET;
 
 const app = express();
 app.use(express.json());
-app.use(cookieParser());
 app.use(cors({
     credentials: true,
     origin: 'http://localhost:5173',
@@ -30,6 +29,22 @@ const uploadsDir = __dirname + '/uploads';
 if (!fs.existsSync(uploadsDir)) {
     fs.mkdirSync(uploadsDir);
 }
+
+// Middleware for authentication
+const authenticate = (req, res, next) => {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) {
+        jwt.verify(token, jwtSecret, {}, (err, userData) => {
+            if (err) {
+                return res.status(401).json('invalid token');
+            }
+            req.userData = userData;
+            next();
+        });
+    } else {
+        res.status(401).json('no token');
+    }
+};
 
 app.get('/test', (req, res) => {
     res.json('test ok');
@@ -45,8 +60,9 @@ app.post('/register', async (req, res) => {
         });
         jwt.sign({userId: createdUser._id, username}, jwtSecret, {}, (err, token) => {
             if (err) throw err;
-            res.cookie('token', token, {sameSite: 'none', secure: true}).status(201).json({
+            res.status(201).json({
                 id: createdUser._id,
+                token: token,
             });
         });
     } catch(err) {
@@ -66,8 +82,10 @@ app.post('/login', async (req, res) => {
         if (passOk) {
             jwt.sign({userId: foundUser._id, username}, jwtSecret, {}, (err, token) => {
                 if (err) throw err;
-                res.cookie('token', token, {sameSite: 'none', secure: true}).json({
+                res.json({
                     id: foundUser._id,
+                    username: username,
+                    token: token,
                 });
             });
         } else {
@@ -78,49 +96,21 @@ app.post('/login', async (req, res) => {
     }
 });
 
-app.get('/profile', (req, res) => {
-    const token = req.cookies?.token;
-    if (token) {
-        try {
-            jwt.verify(token, jwtSecret, {}, (err, userData) => {
-                if (err) {
-                    res.status(401).json('invalid token');
-                } else {
-                    res.json(userData);
-                }
-            });
-        } catch (err) {
-            res.status(500).json('error');
-        }
-    } else {
-        res.status(401).json('no token');
-    }
+app.get('/profile', authenticate, (req, res) => {
+    res.json(req.userData);
 });
 
-async function getUserDataFromRequest(req) {
-    return new Promise((resolve, reject) => {
-        const token = req.cookies?.token;
-        if (token) {
-            try {
-                jwt.verify(token, jwtSecret, {}, (err, userData) => {
-                    if (err) {
-                        reject('invalid token');
-                    } else {
-                        resolve(userData);
-                    }
-                });
-            } catch (err) {
-                reject('error');
-            }
-        } else {
-            reject('no token');
-        }
-    });
-}
-
 app.get('/people', async (req, res) => {
-    const users = await User.find({}, {'_id':1, username:1});
+    const { page = 1, limit = 10 } = req.query;
+    const users = await User.find({}, { '_id': 1, username: 1 })
+        .skip((page - 1) * limit)
+        .limit(limit);
     res.json(users);
+});
+
+app.get('/people/count', async (req, res) => {
+    const count = await User.countDocuments();
+    res.json({ count });
 });
 
 app.get('/messages/:userId', async (req, res) => {
@@ -134,160 +124,182 @@ app.get('/messages/:userId', async (req, res) => {
     res.json(messages);
 });
 
-const server = app.listen(4040);
+async function startServer() {
+    const mongod = await MongoMemoryServer.create();
+    const uri = mongod.getUri();
+    await mongoose.connect(uri);
+    console.log('Connected to in-memory database');
 
-const wss = new ws.WebSocketServer({server});
-wss.on('connection', (connection, req) => {
-
-    function notifyAboutOnlinePeople() {
-        [...wss.clients].forEach(client => {
-            client.send(JSON.stringify({
-                online: [...wss.clients].map(c => ({userId: c.userId, username: c.username})),
-            }));
-        });
-    }
-
-    connection.isAlive = true;
-    connection.timer = setInterval(() => {
-        connection.ping();
-        connection.deathTimer = setTimeout(() => {
-            connection.isAlive = false;
-            clearInterval(connection.timer);
-            connection.terminate();
-            notifyAboutOnlinePeople();
-        }, 1000);
-    }, 5000);
-
-    connection.on('pong', () => {
-        clearTimeout(connection.deathTimer);
+    const server = app.listen(process.env.PORT || 4040, () => {
+        console.log(`Server listening on port ${process.env.PORT || 4040}`);
     });
 
-    const cookies = req.headers.cookie;
-    if (cookies) {
-        const tokenCookieString = cookies.split(';').find(str => str.startsWith('token='));
-        if (tokenCookieString) {
-            const token = tokenCookieString.split('=')[1];
-            if (token) {
-                try {
-                    jwt.verify(token, jwtSecret, {}, (err, userData) => {
-                        if (err) {
-                            console.error(err);
-                            connection.terminate();
-                        } else {
-                            const {userId, username} = userData;
-                            connection.userId = userId;
-                            connection.username = username;
-                        }
-                    });
-                } catch (err) {
-                    console.error(err);
-                    connection.terminate();
+    const wss = new ws.WebSocketServer({server});
+    wss.on('connection', (connection, req) => {
+
+        function notifyAboutOnlinePeople() {
+            const online = [...wss.clients].map(c => ({userId: c.userId, username: c.username}));
+            const data = JSON.stringify({online});
+            [...wss.clients].forEach(client => {
+                client.send(data);
+            });
+        }
+
+        connection.isAlive = true;
+        connection.timer = setInterval(() => {
+            connection.ping();
+            connection.deathTimer = setTimeout(() => {
+                connection.isAlive = false;
+                clearInterval(connection.timer);
+                connection.terminate();
+                notifyAboutOnlinePeople();
+            }, 1000);
+        }, 5000);
+
+        connection.on('pong', () => {
+            clearTimeout(connection.deathTimer);
+        });
+
+        const cookies = req.headers.cookie;
+        if (cookies) {
+            const tokenCookieString = cookies.split(';').find(str => str.startsWith('token='));
+            if (tokenCookieString) {
+                const token = tokenCookieString.split('=')[1];
+                if (token) {
+                    try {
+                        jwt.verify(token, jwtSecret, {}, (err, userData) => {
+                            if (err) {
+                                console.error(err);
+                                connection.terminate();
+                            } else {
+                                const {userId, username} = userData;
+                                connection.userId = userId;
+                                connection.username = username;
+                            }
+                        });
+                    } catch (err) {
+                        console.error(err);
+                        connection.terminate();
+                    }
                 }
             }
         }
-    }
 
-    async function handleNewMessage(messageData, connection) {
-        const {recipient, text, file} = messageData;
-        let filename = null;
-        if (file) {
-            const parts = file.name.split('.');
-            const ext = parts[parts.length - 1];
-            filename = Date.now() + '.' + ext;
-            const path = __dirname + '/uploads/' + filename;
-            const bufferData = Buffer.from(file.data.split(',')[1], 'base64');
-            fs.writeFile(path, bufferData, (err) => {
-                if (err) {
-                    console.error(err);
-                } else {
-                    console.log('file saved:' + path);
-                }
-            });
-        }
-        if (recipient && (text || file)) {
-            const messageDoc = await Message.create({
-                sender: connection.userId,
-                recipient,
-                text,
-                file: file ? filename : null,
-            });
-            [...wss.clients]
-                .filter(c => c.userId === recipient)
-                .forEach(c => c.send(JSON.stringify({
-                    text,
+        async function handleNewMessage(messageData, connection) {
+            const {recipient, text, file} = messageData;
+            let filename = null;
+            if (file) {
+                const parts = file.name.split('.');
+                const ext = parts[parts.length - 1];
+                filename = Date.now() + '.' + ext;
+                const path = __dirname + '/uploads/' + filename;
+                const bufferData = Buffer.from(file.data.split(',')[1], 'base64');
+                fs.writeFile(path, bufferData, (err) => {
+                    if (err) {
+                        console.error(err);
+                    } else {
+                        console.log('file saved:' + path);
+                    }
+                });
+            }
+            if (recipient && (text || file)) {
+                const messageDoc = await Message.create({
                     sender: connection.userId,
                     recipient,
+                    text,
                     file: file ? filename : null,
-                    _id: messageDoc._id,
-                })));
+                });
+                [...wss.clients]
+                    .filter(c => c.userId === recipient)
+                    .forEach(c => c.send(JSON.stringify({
+                        text,
+                        sender: connection.userId,
+                        recipient,
+                        file: file ? filename : null,
+                        _id: messageDoc._id,
+                    })));
+            }
         }
-    }
 
-    async function handleTyping(messageData, connection) {
-        [...wss.clients]
-            .filter(c => c.userId === messageData.recipient)
-            .forEach(c => c.send(JSON.stringify({
-                typing: true,
-                sender: connection.userId,
-            })));
-    }
-
-    async function handleDelete(messageData, connection) {
-        const message = await Message.findById(messageData.delete);
-        if (message.sender.toString() === connection.userId) {
-            await Message.findByIdAndUpdate(messageData.delete, {text: 'This message was deleted'});
+        async function handleTyping(messageData, connection) {
             [...wss.clients]
                 .filter(c => c.userId === messageData.recipient)
                 .forEach(c => c.send(JSON.stringify({
-                    delete: messageData.delete,
-                })));
-        }
-    }
-
-    async function handleEdit(messageData, connection) {
-        const message = await Message.findById(messageData.edit.messageId);
-        if (message.sender.toString() === connection.userId) {
-            await Message.findByIdAndUpdate(messageData.edit.messageId, {text: messageData.edit.text});
-            [...wss.clients]
-                .filter(c => c.userId === messageData.recipient)
-                .forEach(c => c.send(JSON.stringify({
-                    edit: messageData.edit,
-                })));
-        }
-    }
-
-    async function handleReaction(messageData, connection) {
-        const message = await Message.findById(messageData.messageId);
-        if (message) {
-            await Message.findByIdAndUpdate(messageData.messageId, {$push: {reactions: messageData.reaction}});
-            [...wss.clients]
-                .filter(c => c.userId === messageData.recipient)
-                .forEach(c => c.send(JSON.stringify({
-                    reaction: messageData.reaction,
-                    messageId: messageData.messageId,
+                    typing: true,
                     sender: connection.userId,
                 })));
         }
-    }
 
-    connection.on('message', async (message) => {
-        try {
-            const messageData = JSON.parse(message.toString());
-            if (messageData.recipient && (messageData.text || messageData.file)) {
-                await handleNewMessage(messageData, connection);
-            } else if (messageData.typing) {
-                await handleTyping(messageData, connection);
-            } else if (messageData.delete) {
-                await handleDelete(messageData, connection);
-            } else if (messageData.edit) {
-                await handleEdit(messageData, connection);
-            } else if (messageData.reaction) {
-                await handleReaction(messageData, connection);
+        async function handleDelete(messageData, connection) {
+            const message = await Message.findById(messageData.delete);
+            if (message.sender.toString() === connection.userId) {
+                await Message.findByIdAndUpdate(messageData.delete, {text: 'This message was deleted'});
+                [...wss.clients]
+                    .filter(c => c.userId === messageData.recipient)
+                    .forEach(c => c.send(JSON.stringify({
+                        delete: messageData.delete,
+                    })));
             }
-        } catch (err) {
-            console.error(err);
         }
-    });
 
-    notifyAboutOnlinePeople();
-});
+        async function handleEdit(messageData, connection) {
+            const message = await Message.findById(messageData.edit.messageId);
+            if (message.sender.toString() === connection.userId) {
+                await Message.findByIdAndUpdate(messageData.edit.messageId, {text: messageData.edit.text});
+                [...wss.emails]
+                    .filter(c => c.userId === messageData.recipient)
+                    .forEach(c => c.send(JSON.stringify({
+                        edit: messageData.edit,
+                    })));
+            }
+        }
+
+        async function handleReaction(messageData, connection) {
+            const message = await Message.findById(messageData.messageId);
+            if (message && (message.sender.toString() === connection.userId || message.recipient.toString() === connection.userId)) {
+                await Message.findByIdAndUpdate(messageData.messageId, {$push: {reactions: messageData.reaction}});
+                [...wss.clients]
+                    .filter(c => c.userId === message.sender.toString() || c.userId === message.recipient.toString())
+                    .forEach(c => c.send(JSON.stringify({
+                        reaction: messageData.reaction,
+                        messageId: messageData.messageId,
+                        sender: connection.userId,
+                    })));
+            }
+        }
+
+        function handleSignaling(messageData, connection) {
+            [...wss.clients]
+                .filter(c => c.userId === messageData.recipient)
+                .forEach(c => c.send(JSON.stringify({
+                    ...messageData,
+                    sender: connection.userId,
+                })));
+        }
+
+        connection.on('message', async (message) => {
+            try {
+                const messageData = JSON.parse(message.toString());
+                if (messageData.recipient && (typeof messageData.text === 'string' || messageData.file)) {
+                    await handleNewMessage(messageData, connection);
+                } else if (messageData.typing && messageData.recipient) {
+                    await handleTyping(messageData, connection);
+                } else if (messageData.delete && mongoose.Types.ObjectId.isValid(messageData.delete)) {
+                    await handleDelete(messageData, connection);
+                } else if (messageData.edit && mongoose.Types.ObjectId.isValid(messageData.edit.messageId) && typeof messageData.edit.text === 'string') {
+                    await handleEdit(messageData, connection);
+                } else if (messageData.reaction && mongoose.Types.ObjectId.isValid(messageData.messageId) && typeof messageData.reaction === 'string') {
+                    await handleReaction(messageData, connection);
+                } else if (messageData.recipient && (messageData['call-offer'] || messageData['call-answer'] || messageData['ice-candidate'] || messageData['call-hangup'] || messageData['call-decline'])) {
+                    handleSignaling(messageData, connection);
+                }
+            } catch (err) {
+                console.error(err);
+            }
+        });
+
+        notifyAboutOnlinePeople();
+    });
+}
+
+startServer();

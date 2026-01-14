@@ -1,7 +1,6 @@
-import axios from "axios";
-import { useContext } from "react";
-import { useState } from "react";
+import { useContext, useState } from "react";
 import { UserContext } from "./UserContext";
+import authService from "./services/authService";
 
 const RegisterAndLoginForm = () => {
   const [username, setUsername] = useState("");
@@ -11,35 +10,29 @@ const RegisterAndLoginForm = () => {
 
   const { setUsername: setLoggedInUserName, setId } = useContext(UserContext);
 
-  async function handleSubmit(ev) {
+  const handleSubmit = async (ev) => {
     ev.preventDefault();
-
-    const url = isLoginOrRegister === "register" ? "register" : "login";
-
     try {
-      const { data } = await axios.post(url, { username, password });
-      setLoggedInUserName(username);
-      setId(data.id);
+      if (isLoginOrRegister === "register") {
+        await authService.register(username, password);
+        // After successful registration, switch to login view
+        setIsLoginOrRegister("login");
+        setError(""); // Clear previous errors
+      } else {
+        const data = await authService.login(username, password);
+        setLoggedInUserName(data.username);
+        setId(data.id);
+      }
     } catch (err) {
-      if (err.response && err.response.status === 400) {
-        setError(
-          "Username already exists. Please choose a different username."
-        );
-      } else {
-        console.error(err);
-      }
-      if (err.response && err.response.status === 401) {
-        setError("Incorrect password");
-      } else {
-        console.error(err);
-      }
-      if (err.response && err.response.status === 402) {
-        setError("Unauthorized: User not found");
-      } else {
-        console.error(err);
-      }
+      const resMessage =
+        (err.response &&
+          err.response.data &&
+          err.response.data.message) ||
+        err.message ||
+        err.toString();
+      setError(resMessage);
     }
-  }
+  };
 
   return (
     <div className="bg-blue-50 h-screen flex items-center">
